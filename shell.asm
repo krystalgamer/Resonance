@@ -33,6 +33,8 @@ mov functionStoreAddress, 12345678h
 cmp tmp, addressOfUnencripted
 jle resetAddressOfUnencripted
 
+
+mov byte [addressOfUnencripted], 0x90;nop old shit
 ;time to move it
 add addressOfUnencripted, 1 ;increase it
 mov [12345678h], addressOfUnencripted ; update it
@@ -42,6 +44,7 @@ mov ecx, functionSize
 
 copy:
 movsb
+xor byte [addressOfUnencripted-1], 0xf2
 loop copy
 
 jmp endJustDoIt
