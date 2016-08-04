@@ -140,9 +140,6 @@ int main(){
 	
 	CreateProcess("test.exe", NULL, NULL, NULL, FALSE, CREATE_SUSPENDED | CREATE_NEW_CONSOLE, NULL, NULL, &startupInfo, &processInfo);
 	
-	
-	//HANDLE address = VirtualAllocEx(processInfo.hProcess, NULL, 50, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-	
 	DWORD moduleSize = 0, baseAddr = 0;
 
 	ResumeThread(processInfo.hThread);
@@ -157,12 +154,8 @@ int main(){
 	FUNCTION function;
 	function.startAddr = function.size = 0;
 	getFunctionsToEncrypt(processInfo.hProcess, baseAddr, moduleSize, &function);
-	
-	
-	PASM_INSTRUCTION pAsmInstructionList = NULL;
-	addAllAsmInstructions(&pAsmInstructionList);
-	
-	if(interptFunction(processInfo.hProcess, function,  pAsmInstructionList))
+
+	if(interptFunction(processInfo.hProcess, function))
 		MessageBoxA(NULL,"YEAH", "YEAH", 0);
 	else
 		MessageBoxA(NULL,"NO", "NO", 0);
