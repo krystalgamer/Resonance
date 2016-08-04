@@ -35,6 +35,7 @@ jle resetAddressOfUnencripted
 
 
 mov byte [addressOfUnencripted], 0x90;nop old shit
+
 ;time to move it
 add addressOfUnencripted, 1 ;increase it
 mov [12345678h], addressOfUnencripted ; update it
@@ -50,6 +51,12 @@ loop copy
 jmp endJustDoIt
 
 resetAddressOfUnencripted:
+mov ecx, functionSize
+
+nopEndOfMemory:;this is needed because when it goes back to start there are leftovers
+mov byte [addressOfUnencripted+ecx-1], 0x90
+loop nopEndOfMemory
+
 mov addressOfUnencripted, startAddress
 mov [12345678h], addressOfUnencripted ;address where addressOfUnencripted is stored
 jmp copyFunction
