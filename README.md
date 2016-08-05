@@ -17,7 +17,7 @@ or ecx, ecx
 ``` 
 
 What has been done so far?
-- Detects the target function and successfully dissassembles it. (Thanks to [capstone])
+- Detects the target function and successfully dissassembles it. (Thanks to [Capstone])
 - Fixes relative JMPs and CALLs
 - Encrypts it to a new memory location
 - Decrypts it at runtime and moves it around in memory
@@ -30,3 +30,5 @@ Currently it's usage is limited since it's in early development but if you reall
 - Add the identifiers to one function in your program and compile it too.
 -  Make sure that the program is named test.exe
 -  Run Resonance!
+-  
+[Capstone]: <https://github.com/aquynh/capstone>
