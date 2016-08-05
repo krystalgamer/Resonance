@@ -50,11 +50,13 @@ BOOL interptFunction(HANDLE hProcess, FUNCTION function){
 				
 				if(operand->imm > function.startAddr + function.size){
 					
-					if(!fixRelativeJmpOrCall(operand->imm, byteCounter, &pAbsInstruction, insn[currIns].size,strcmp(insn[currIns].mnemonic, "jmp")))
+					BOOL fixRelativeJmpOrCallResult = 0;
+					
+					if(!(fixRelativeJmpOrCallResult = fixRelativeJmpOrCall(operand->imm, byteCounter, &pAbsInstruction, insn[currIns].size,strcmp(insn[currIns].mnemonic, "call"))))
 						return FALSE;
 					
 					printf("Found one relative jmp/call to fix!\n");
-					byteCounter += 6;
+					byteCounter += fixRelativeJmpOrCallResult;
 				}
 				else
 					byteCounter += insn[currIns].size;
@@ -160,6 +162,7 @@ BOOL interptFunction(HANDLE hProcess, FUNCTION function){
 
 BOOL fixRelativeJmpOrCall(int64_t jmpLocation, DWORD numBytes, PABS_INSTRUCTION *pAbsInstruction, DWORD originalSize, BOOLEAN isJmp){
 	
+	
 	if(!(*pAbsInstruction))
 		*pAbsInstruction = malloc(sizeof(ABS_INSTRUCTION));
 	else
@@ -170,15 +173,44 @@ BOOL fixRelativeJmpOrCall(int64_t jmpLocation, DWORD numBytes, PABS_INSTRUCTION 
 	
 	memset((*pAbsInstruction), 0, sizeof(ABS_INSTRUCTION));
 	
-	(*pAbsInstruction)->opcode = 0xFF;
-	(*pAbsInstruction)->modReg = (((isJmp ? 2 : 4) << 3) | 5);
-	(*pAbsInstruction)->address = jmpLocation;
+	(*pAbsInstruction)->type = ABS_CALL; //DEFAULT
 	(*pAbsInstruction)->bytePosition = numBytes;
 	(*pAbsInstruction)->originalSize = originalSize;
-	(*pAbsInstruction)->alreadyStored = FALSE;//just to be sure
 	(*pAbsInstruction)->next = NULL;
 	
-	return TRUE;
+	if(!isJmp)
+		(*pAbsInstruction)->type = ABS_CALL;
+	
+	
+	//Name doesn't matter
+	(*pAbsInstruction)->pPushRetn = malloc( ((*pAbsInstruction)->type == PUSH_RETN) ? sizeof(PUSH_RETN_STRUCT) : sizeof(ABS_CALL_STRUCT));
+	if(!((*pAbsInstruction)->pPushRetn))
+		return FALSE;
+	
+	(*pAbsInstruction)->newSize = ((*pAbsInstruction)->type == PUSH_RETN) ? sizeof(PUSH_RETN_STRUCT) : sizeof(ABS_CALL_STRUCT) - 4;
+	
+	if(((*pAbsInstruction)->type == PUSH_RETN)){
+		(*pAbsInstruction)->pPushRetn->callOpcode = 0xE8;
+		(*pAbsInstruction)->pPushRetn->emptyAddress = 0x00000000;
+	
+		(*pAbsInstruction)->pPushRetn->prepareJmp[0] = 0x83;
+		(*pAbsInstruction)->pPushRetn->prepareJmp[1] = 0x04;
+		(*pAbsInstruction)->pPushRetn->prepareJmp[2] = 0x24;
+		(*pAbsInstruction)->pPushRetn->prepareJmp[3] = 10;
+	
+		(*pAbsInstruction)->pPushRetn->pushOpcode = 0x68;
+		(*pAbsInstruction)->pPushRetn->pushAddress= jmpLocation;
+		(*pAbsInstruction)->pPushRetn->retnOpcode= 0xC3;
+	
+		return (*pAbsInstruction)->newSize;
+	}
+	
+	(*pAbsInstruction)->pAbsCall->opcode = 0xFF;
+	(*pAbsInstruction)->pAbsCall->modReg = (((isJmp ? 4 : 2) << 3) | 5);
+	(*pAbsInstruction)->pAbsCall->address = jmpLocation;
+	(*pAbsInstruction)->pAbsCall->alreadyStored = FALSE;
+
+	return (*pAbsInstruction)->newSize;
 	
 }
 
@@ -206,27 +238,36 @@ BOOL getAbsoluteAddressStorage(HANDLE hProcess, PABS_INSTRUCTION pAbsInstruction
 		if(curId > counter)//We fucked
 			return FALSE;
 		
-		if(tmp->alreadyStored){
+		if(tmp->type != ABS_CALL){
 			tmp = tmp->next;
 			continue; //Dont increase the id because i'll get us problems
 		}
 		
+		if(tmp->pAbsCall->alreadyStored){
+			tmp = tmp->next;
+			continue; 
+		}
+		
 		//Copy to the address buffer
-		addressBuffer[curId] = tmp->address;
-		tmp->idInStorage = curId;
-		tmp->alreadyStored = TRUE;
+		addressBuffer[curId] = tmp->pAbsCall->address;
+		tmp->pAbsCall->idInStorage = curId;
+		tmp->pAbsCall->alreadyStored = TRUE;
 		
 		tmp2 = tmp->next;
 		while(tmp2){
 			
-			if(tmp2->alreadyStored){
+			if(tmp2->type != ABS_CALL){
+				tmp2 = tmp2->next;
+				continue;
+			}
+			if(tmp2->pAbsCall->alreadyStored){
 				tmp2 = tmp2->next;
 				continue;
 			}
 			
-			if(tmp2->address == addressBuffer[curId]){
-				tmp2->idInStorage = curId;
-				tmp2->alreadyStored = TRUE;
+			if(tmp2->pAbsCall->address == addressBuffer[curId]){
+				tmp2->pAbsCall->idInStorage = curId;
+				tmp2->pAbsCall->alreadyStored = TRUE;
 			}
 			tmp2 = tmp2->next;
 		}
@@ -243,10 +284,16 @@ BOOL getAbsoluteAddressStorage(HANDLE hProcess, PABS_INSTRUCTION pAbsInstruction
 	//Now that everything is setup we'll change the id to the correct memory address
 	tmp = pAbsInstruction;
 	while(tmp){
-		if(!tmp->alreadyStored)//??
+		
+		if(tmp->type != ABS_CALL){
+			tmp = tmp->next;
+			continue;
+		}
+		
+		if(!tmp->pAbsCall->alreadyStored)//??
 			return FALSE;
-			
-		tmp->address = (DWORD)(addressBufferStorage+tmp->idInStorage*sizeof(DWORD));
+
+		tmp->pAbsCall->address = (DWORD)(addressBufferStorage+tmp->pAbsCall->idInStorage*sizeof(DWORD));
 		tmp = tmp->next;
 	}
 	
@@ -259,6 +306,7 @@ BOOL getAbsoluteAddressStorage(HANDLE hProcess, PABS_INSTRUCTION pAbsInstruction
 BYTE* createNewFunction(const BYTE *originalFunction, DWORD newFunctionSize, PABS_INSTRUCTION pAbsInstruction){
 	
 	DWORD curPosOrig = 0, curPosNew = 0;
+	DWORD sizeDifference = 0;
 	
 	PABS_INSTRUCTION tmpAbs;
 	tmpAbs = pAbsInstruction;
@@ -273,13 +321,15 @@ BYTE* createNewFunction(const BYTE *originalFunction, DWORD newFunctionSize, PAB
 	
 	while(curPosNew != newFunctionSize){
 		
-		memcpy((void*)newFunction+curPosNew, (void*)originalFunction+curPosOrig, ((tmpAbs == NULL) ? newFunctionSize - 1: tmpAbs->bytePosition) - curPosOrig);
-		curPosNew += (((tmpAbs == NULL) ? newFunctionSize - 1: tmpAbs->bytePosition) - curPosOrig) ;
-		curPosOrig += (((tmpAbs == NULL) ? newFunctionSize - 1: tmpAbs->bytePosition) - curPosOrig);
+		sizeDifference = 0;
+		memcpy((void*)newFunction+curPosNew, (void*)originalFunction+curPosOrig, ((tmpAbs == NULL) ? newFunctionSize : tmpAbs->bytePosition) - curPosNew);
+		sizeDifference = (((tmpAbs == NULL) ? newFunctionSize : tmpAbs->bytePosition) - curPosNew);
+		curPosNew += sizeDifference;
+		curPosOrig += sizeDifference;
 		
 		if(tmpAbs){
-			memcpy((void*)newFunction+curPosNew, tmpAbs, 6);//Copy the fixed
-			curPosNew += 6;
+			memcpy((void*)newFunction+curPosNew, ((tmpAbs->type == ABS_CALL) ? (void*)tmpAbs->pAbsCall : (void*)tmpAbs->pPushRetn), tmpAbs->newSize);//Copy the fixed
+			curPosNew += tmpAbs->newSize;
 			curPosOrig += tmpAbs->originalSize;
 			tmpAbs = tmpAbs->next;
 		}
