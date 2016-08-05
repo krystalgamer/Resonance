@@ -179,7 +179,7 @@ BOOL fixRelativeJmpOrCall(int64_t jmpLocation, DWORD numBytes, PABS_INSTRUCTION 
 	(*pAbsInstruction)->next = NULL;
 	
 	if(!isJmp)
-		(*pAbsInstruction)->type = ABS_CALL;
+		(*pAbsInstruction)->type = (rand()%2 == 0) ? PUSH_RETN : ABS_CALL;
 	
 	
 	//Name doesn't matter
