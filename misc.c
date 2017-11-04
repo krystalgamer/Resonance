@@ -51,6 +51,23 @@ void freeLinkedList(void **entry, DWORD sizeOfEntry){
 	*(DWORD**)entry = NULL;
 }
 
+void removeLastEntry(void **entry, uint32_t sizeOfEntry){
+	
+	if(!(*(uint32_t*)entry))
+		return;//should never reach here
+	
+	uint32_t *curNext = (uint32_t*)(*(uint32_t*)entry + sizeOfEntry-4);
+	if((void*)*curNext == NULL){
+		
+		free(*entry);//no leaks
+		*entry = NULL;
+		return;
+	}
+	
+	removeLastEntry((void*)((*(uint32_t*)entry)+sizeOfEntry-4), sizeOfEntry);
+	
+}
+
 
 
 

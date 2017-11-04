@@ -1,339 +1,447 @@
 #include "xor.h"
-#include "include/capstone.h"
 
 
-BOOL interptFunction(HANDLE hProcess, FUNCTION function){
+bool generateAsm(uint8_t **encoding, size_t *encodingSize, const uint8_t *asmString, ...);
+void formatAsmString(va_list valist, uint8_t *asmBuffer,const uint8_t *asmString, uint32_t numReplace);
+void newFormatAsmString(va_list valist, uint8_t *asmBuffer,const uint8_t *asmString, uint32_t *indexOrder,uint32_t numReplace);
+
+ks_engine *ksHandle = NULL;
+csh csHandle;
+
+bool initEngines(){
+	
+	if(ksHandle)//if this is set then capstone is set
+		return true;
+		
+	//capstone
+	if (cs_open(CS_ARCH_X86, CS_MODE_32, &csHandle) != CS_ERR_OK)
+      return false;
+	cs_option(csHandle, CS_OPT_DETAIL, CS_OPT_ON);
+	
+	//keystone
+	if(ks_open(KS_ARCH_X86, KS_MODE_32, &ksHandle) != KS_ERR_OK)
+		return false;
+	ks_option(ksHandle, KS_OPT_SYNTAX, KS_OPT_SYNTAX_RADIX16);
+	
+	return true;
+}
+
+bool interptFunction(HANDLE hProcess, FUNCTION function){
+	
+	if(!initEngines()){
+		printf("Couldn't init engines..\n");
+		return false;
+	}
 	
 	unsigned char *buffer;
-	SIZE_T bytesRead = 0;
-	
 	if(!(buffer = malloc(function.size)))
-		return FALSE;
+		return false;
 	
-	if(!ReadProcessMemory(hProcess, (void*)function.startAddr, buffer, function.size, &bytesRead) && bytesRead != function.size){
-		MessageBoxA(NULL, "ReadProcessMemory2 failed!", "FAILED", 0);
-		return FALSE;
+	//Reads function from memory
+	if(!ReadProcessMemory(hProcess, (void*)function.startAddr, buffer, function.size, NULL)){
+		MessageBoxA(NULL, "Couldn't read the function!", "FAILED", 0);
+		return false;
 	}
 
-	csh handle;
 	cs_insn *insn;
 	size_t count;
  
-	if (cs_open(CS_ARCH_X86, CS_MODE_32, &handle) != CS_ERR_OK)
-      return -1;
-	cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+	//capstone stuff
+	count = cs_disasm(csHandle, buffer, function.size, function.startAddr, 0, &insn);
 	
+	OutsideInstruction *OIList = NULL;
+	ModifiedInstruction *MIList = NULL;
+	TrashInstruction *TIList = NULL;
+	JmpInstruction *JIList = NULL;
 	
-	count = cs_disasm(handle, buffer, function.size, function.startAddr, 0, &insn);
+	OIList = createOustideInstruction();
+	MIList = createModifiedInstruction();
+	TIList = createTrashInstruction();
+	JIList = createJmpInstruction();
 	
+	if(count <= 0){
+		printf("ERROR: Failed to disassemble given code!\n");
+		return false;
+	}
 	
-	PABS_INSTRUCTION pAbsInstruction = NULL;
-	size_t byteCounter = 0;
-	
-	if (count > 0) {
-		size_t currIns = 0;
-		cs_x86 *x86_insn = NULL;
+	size_t currIns = 0;
+	cs_x86 *curInstruction = NULL;
 		
-		for (currIns = 0; currIns < count; currIns++) {
+	for (currIns = 0; currIns < count; currIns++) {
+		if(insn[currIns].id == X86_INS_JMP || insn[currIns].id == X86_INS_CALL){
 			
-			if(!strcmp(insn[currIns].mnemonic, "jmp") || !strcmp(insn[currIns].mnemonic, "call")){
+			curInstruction = &(insn[currIns].detail->x86);//curInstruction now holds the x86 details
+			if(curInstruction->op_count != 1)//In jumps or calls op_count must always be 1
+				return false;
+			
+			cs_x86_op *operand = &(curInstruction->operands[0]);
+			if(operand->type != X86_OP_IMM)//only work with immediates
+				continue;
+			
+			//Checks if jump goes to outside the function
+			if(operand->imm > function.startAddr + function.size){
+				addToOutisdeInstructionList(OIList, &insn[currIns], currIns);
 				
-				x86_insn = &(insn[currIns].detail->x86);
-				
-				if(x86_insn->op_count != 1)//Something went wrong
-					return FALSE;
-				
-				cs_x86_op *operand = &(x86_insn->operands[0]);
-				
-				if(operand->type != X86_OP_IMM)
-					continue;
-				
-				if(operand->imm > function.startAddr + function.size){
-					
-					BOOL fixRelativeJmpOrCallResult = 0;
-					
-					if(!(fixRelativeJmpOrCallResult = fixRelativeJmpOrCall(operand->imm, byteCounter, &pAbsInstruction, insn[currIns].size,strcmp(insn[currIns].mnemonic, "call"))))
-						return FALSE;
-					
-					printf("Found one relative jmp/call to fix!\n");
-					byteCounter += fixRelativeJmpOrCallResult;
-				}
-				else
-					byteCounter += insn[currIns].size;
+				printf("Found relative %s to fix!\n", (insn[currIns].id == X86_INS_CALL ? "call" : "jmp"));
 			}
-			else
-				byteCounter += insn[currIns].size;
+			else{
+				printf("One internal relative jmp might need to be fixed\n");
+				if(!addToJmpInstructionList(JIList, currIns)){
+					printf("Unknown error occured\n");
+					return false;
+				}
+			}
 		}
- 
-		cs_free(insn, count);
-	}
-	else
-      printf("ERROR: Failed to disassemble given code!\n");
- 
-	cs_close(&handle);
-	fflush(stdout);
-	
-	if(!getAbsoluteAddressStorage(hProcess, pAbsInstruction))
-		return FALSE;
-	
-	BYTE* newFunction = createNewFunction(buffer, byteCounter,  pAbsInstruction);
-	
-	if(!newFunction)
-		return FALSE;
-	
-	BYTE* encryptedFunction = malloc(byteCounter);
-	if(!encryptedFunction)
-		return FALSE;
-	
-	memcpy(encryptedFunction, newFunction, byteCounter);
-	
-	int encryptLocation = 0;
-	while(encryptLocation<byteCounter){
-		encryptedFunction[encryptLocation++] ^= 0xF2;
-	}
-	
-	#define SHELL_SIZE 117
-	unsigned char sexyShell[SHELL_SIZE] = {
-		0x60, 0x9C, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x81, 0xF9, 0xFF, 0x00, 0x00, 0x00, 0x75, 0x55, 0xC7,
-		0x05, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0xBB, 0x69, 0x00, 0x00, 0x00, 0xB8, 0x68,
-		0x00, 0x00, 0x00, 0xBF, 0x67, 0x00, 0x00, 0x00, 0x89, 0xDA, 0xD1, 0xE2, 0x01, 0xC2, 0x83, 0xC2,
-		0x01, 0xBE, 0x78, 0x56, 0x34, 0x12, 0x39, 0xFA, 0x7E, 0x17, 0xC6, 0x07, 0x90, 0x83, 0xC7, 0x01,
-		0x89, 0x3D, 0x78, 0x56, 0x34, 0x12, 0x89, 0xD9, 0xA4, 0x80, 0x77, 0xFF, 0xF2, 0xE2, 0xF9, 0xEB,
-		0x1C, 0x89, 0xD9, 0xC6, 0x44, 0x0F, 0xFF, 0x90, 0xE2, 0xF9, 0x89, 0xC7, 0x89, 0x3D, 0x78, 0x56,
-		0x34, 0x12, 0xEB, 0xE2, 0x83, 0xC1, 0x01, 0x89, 0x0D, 0x78, 0x56, 0x34, 0x12, 0x9D, 0x61, 0xFF,
-		0x25, 0x78, 0x56, 0x34, 0x12 
-	};
-
-
-
-
-	HANDLE address2 = VirtualAllocEx(hProcess, NULL, byteCounter+sizeof(DWORD)+SHELL_SIZE+byteCounter*3, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);//4 extra bytes for the address
-	
-	
-	if(!address2)
-		return FALSE;
-	
-	if(!WriteProcessMemory(hProcess, (void*)address2, (void*)encryptedFunction, byteCounter, NULL))//Write the encrypted function to memory
-		return FALSE;
-	
-	if(!WriteProcessMemory(hProcess, (void*)address2+byteCounter+sizeof(DWORD)+SHELL_SIZE, (void*)newFunction, byteCounter, NULL))//Write the function to memory
-		return FALSE;
-	
-	DWORD olaAmigos = (DWORD)address2+byteCounter+sizeof(DWORD);
-	if(!WriteProcessMemory(hProcess, (void*)address2+byteCounter, &olaAmigos, sizeof(DWORD), NULL))//Write the address of the shellcode
-		return FALSE;
+		else{
+			if(!addToModifiedInstructionList(MIList, &insn[currIns], currIns)){
+				printf("Error adding instruction to modified instruction list.\n");
+				return false;
+			}
+			
+		}
 		
-	//Convert shell code to self modyfing code
-	//setting the correct counter address
-	DWORD counterAddress = (DWORD)address2+byteCounter+sizeof(DWORD)+0x3;
-	memcpy(sexyShell+0x11, &counterAddress,sizeof(DWORD));
-	memcpy(sexyShell+0x69, &counterAddress,sizeof(DWORD));
-	//setting the function size
-	memcpy(sexyShell+0x1A, &byteCounter,sizeof(DWORD));
-	//setting the startAddress
-	DWORD startAddress = (DWORD)address2+byteCounter+sizeof(DWORD)+SHELL_SIZE;
-	memcpy(sexyShell+0x1F, &startAddress,sizeof(DWORD));
-	//setting addressOfUnencripted
-	DWORD addressOfUnencripted = (DWORD)address2+byteCounter+sizeof(DWORD)+0x24;
-	memcpy(sexyShell+0x24, &startAddress,sizeof(DWORD));
-	memcpy(sexyShell+0x42, &addressOfUnencripted, sizeof(DWORD));
-	memcpy(sexyShell+0x5E, &addressOfUnencripted, sizeof(DWORD));
-	memcpy(sexyShell+0x71, &addressOfUnencripted, sizeof(DWORD));
-	//functionStoreAddress
-	memcpy(sexyShell+0x32, &address2,sizeof(DWORD));
-	
-	if(!WriteProcessMemory(hProcess, (void*)address2+byteCounter+sizeof(DWORD), sexyShell, SHELL_SIZE, NULL))//Write the shellcode
-		return FALSE;
-	
-
-	DWORD fdxTmp = (DWORD)address2+byteCounter;
-	
-	unsigned char absJmp[6] = "\xFF\x25";
-	memcpy(absJmp+2, &fdxTmp, sizeof(DWORD));//Copy the address that contains the address of the function
-	
-	
-	if(!WriteProcessMemory(hProcess, (void*)function.startAddr, absJmp, 6, NULL))//Write the address of the function
-		return FALSE;
-	
-	
-	return TRUE;
-	
-}
-
-BOOL fixRelativeJmpOrCall(int64_t jmpLocation, DWORD numBytes, PABS_INSTRUCTION *pAbsInstruction, DWORD originalSize, BOOLEAN isJmp){
-	
-	
-	if(!(*pAbsInstruction))
-		*pAbsInstruction = malloc(sizeof(ABS_INSTRUCTION));
-	else
-		return fixRelativeJmpOrCall(jmpLocation, numBytes, &((*pAbsInstruction)->next), originalSize,isJmp);
-	
-	if(!(*pAbsInstruction))//It failed
-		return FALSE;
-	
-	memset((*pAbsInstruction), 0, sizeof(ABS_INSTRUCTION));
-	
-	(*pAbsInstruction)->type = ABS_CALL; //DEFAULT
-	(*pAbsInstruction)->bytePosition = numBytes;
-	(*pAbsInstruction)->originalSize = originalSize;
-	(*pAbsInstruction)->next = NULL;
-	
-	if(!isJmp)
-		(*pAbsInstruction)->type = (rand()%2 == 0) ? PUSH_RETN : ABS_CALL;
-	
-	
-	//Name doesn't matter
-	(*pAbsInstruction)->pPushRetn = malloc( ((*pAbsInstruction)->type == PUSH_RETN) ? sizeof(PUSH_RETN_STRUCT) : sizeof(ABS_CALL_STRUCT));
-	if(!((*pAbsInstruction)->pPushRetn))
-		return FALSE;
-	
-	(*pAbsInstruction)->newSize = ((*pAbsInstruction)->type == PUSH_RETN) ? sizeof(PUSH_RETN_STRUCT) : sizeof(ABS_CALL_STRUCT) - 4;
-	
-	if(((*pAbsInstruction)->type == PUSH_RETN)){
-		(*pAbsInstruction)->pPushRetn->callOpcode = 0xE8;
-		(*pAbsInstruction)->pPushRetn->emptyAddress = 0x00000000;
-	
-		(*pAbsInstruction)->pPushRetn->prepareJmp[0] = 0x83;
-		(*pAbsInstruction)->pPushRetn->prepareJmp[1] = 0x04;
-		(*pAbsInstruction)->pPushRetn->prepareJmp[2] = 0x24;
-		(*pAbsInstruction)->pPushRetn->prepareJmp[3] = 10;
-	
-		(*pAbsInstruction)->pPushRetn->pushOpcode = 0x68;
-		(*pAbsInstruction)->pPushRetn->pushAddress= jmpLocation;
-		(*pAbsInstruction)->pPushRetn->retnOpcode= 0xC3;
-	
-		return (*pAbsInstruction)->newSize;
+		if(!addToTrashInstructionList(TIList, currIns)){
+				printf("Couldn't some trash to it :(\n");
+				return false;
+		}
 	}
 	
-	(*pAbsInstruction)->pAbsCall->opcode = 0xFF;
-	(*pAbsInstruction)->pAbsCall->modReg = (((isJmp ? 4 : 2) << 3) | 5);
-	(*pAbsInstruction)->pAbsCall->address = jmpLocation;
-	(*pAbsInstruction)->pAbsCall->alreadyStored = FALSE;
+	removeLastEntry((void*)&OIList, sizeof(OutsideInstruction));
+	removeLastEntry((void*)&MIList, sizeof(ModifiedInstruction));
+	removeLastEntry((void*)&TIList, sizeof(TrashInstruction));
+	removeLastEntry((void*)&JIList, sizeof(JmpInstruction));
+	
+	if(!fixOutisdeInstructionList(OIList)){
+		printf("Couldn't fix OutsideInstructionList.\n");
+		return false;
+	}
 
-	return (*pAbsInstruction)->newSize;
+	if(!fixAffectedRelativeJmps(insn, JIList, OIList, MIList, TIList)){
+		printf("Coudln't fix relative jmps.\n");
+		return false;
+	}
+	
+		  
+	
+	uint32_t sizeOfFixedFunction = 0;
+	uint8_t *fixedFunction = createNewFunction(insn, OIList, MIList, TIList, JIList, count, &sizeOfFixedFunction);
+	HANDLE address2 = VirtualAllocEx(hProcess, NULL, sizeOfFixedFunction, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	
+	printf("Function at address %08X\n", address2);
+	if(!address2)
+		return false;
+	
+	if(!WriteProcessMemory(hProcess, (void*)address2, (void*)fixedFunction, sizeOfFixedFunction, NULL))
+		return false;
+	
+	uint8_t *encoding = NULL;
+	size_t encodingSize = 0;
+	size_t processedInsn = 0;
+	
+	//place a jmp
+	#define PUSH_RETN_JMP "PUSH 0x%08X; RET\0"
+	generateAsm(&encoding, &encodingSize, PUSH_RETN_JMP, address2);
+	if(!WriteProcessMemory(hProcess, (void*)function.startAddr, encoding, encodingSize, NULL))
+		return false;
+  
+	fflush(stdout);
+	cs_free(insn, count);
+	cs_close(&csHandle);
+	return true;
+	
 	
 }
 
-BOOL getAbsoluteAddressStorage(HANDLE hProcess, PABS_INSTRUCTION pAbsInstruction){
+bool generateAsm(uint8_t **encoding, size_t *encodingSize, const uint8_t *asmString, ...){
 	
-	DWORD counter = 0;
-	PABS_INSTRUCTION tmp = pAbsInstruction;
-	PABS_INSTRUCTION tmp2 = NULL;
+	size_t numInstructions = 0;
+	uint32_t sizeOfAsmString = strlen(asmString);
+	uint32_t counter = 0;
+	uint8_t *curPosString = NULL;
+	uint32_t numReplace = 0;
+	static uint8_t asmBuffer[128];
 	
-	//Get how many addresses we'll need(doesnt exclude repeated ones)
-	while(counter){
-		tmp = tmp->next;
+	//how many things we have to replace
+	while(counter < sizeOfAsmString){
+		
+		curPosString = strstr((char*)((uint32_t)asmString+counter), "%");
+		if(!curPosString)
+			break;
+		
+		numReplace++;
+		
+		counter = (uint32_t)curPosString - (uint32_t)asmString;
+		counter++;
+		
+	}
+	
+	if(numReplace){
+		//replace them only if there's anythint to replace
+		va_list valist;
+		va_start(valist, asmString);
+		formatAsmString(valist, asmBuffer, asmString, numReplace);
+	}
+	else{
+		strcpy(asmBuffer, asmString);
+	}
+	
+	
+	counter = numReplace = 0;
+	//numReplace = processedInsn
+	while(counter < sizeOfAsmString){
+		
+		curPosString = strstr((char*)((uint32_t)asmString+counter), ";");
+		if(!curPosString)
+			break;
+		
+		numReplace++;
+		
+		counter = (uint32_t)curPosString - (uint32_t)asmString;
+		counter++;
+		
+	}
+	numReplace++;//last doesn't have semicolon
+	
+	uint32_t processedInsn = 0;
+	if(ks_asm(ksHandle, asmBuffer, 0, encoding, encodingSize, &processedInsn)){
+		printf("Error %s\n", ks_strerror(ks_errno(ksHandle)));
+	}
+	if(processedInsn != numReplace){
+		printf("Error couldn't process all instructions :(\n");
+		return false;
+	}
+	return true;
+}
+
+uint32_t getNewFunctionSize(cs_insn *insn, OutsideInstruction *OIList, ModifiedInstruction *MIList, TrashInstruction *TIList, JmpInstruction *JIList,uint32_t numInstructions){
+	
+	
+	OutsideInstruction *tmpOI = OIList;
+	ModifiedInstruction *tmpMI = MIList;
+	TrashInstruction *tmpTI = TIList;
+	JmpInstruction *tmpJI = JIList;
+	
+	uint32_t finalSize = 0;
+	uint32_t counter = 0;
+	
+	while(counter < numInstructions){
+				
+			if(!tmpOI && !tmpMI && !tmpTI && !tmpJI){
+				finalSize += insn[counter].size;//no more instructions to fix, just add its regular size
+			}
+			else{
+				
+				//needs to be the first since doesn't substitute any function
+				if(tmpTI){
+					if(tmpTI->id == counter){
+						finalSize += tmpTI->trashSize;
+						tmpTI = tmpTI->next;
+					}
+				}
+				
+				if(tmpOI){
+					if(tmpOI->id == counter){//wait until the ids match
+						finalSize += tmpOI->fixedOISize;
+						tmpOI = tmpOI->next;
+						counter++;
+						continue;
+					}
+				}
+				if(tmpMI){
+					if(tmpMI->id == counter){//wait until the ids match
+						finalSize += tmpMI->moddedSize;
+						tmpMI = tmpMI->next;
+						counter++;
+						continue;
+					}
+				}
+				if(tmpJI){
+					if(tmpJI->id == counter){
+						finalSize += tmpJI->jmpSize;
+						tmpJI = tmpJI->next;
+						counter++;
+						continue;
+					}
+				}
+				finalSize += insn[counter].size;//both conditions up there weren't met
+				
+			}
+			
+		
+		counter++;
+	}
+	return finalSize;
+}
+
+//creates with the fixed jmps/calls and modified the instructions
+uint8_t *createNewFunction(cs_insn *insn, OutsideInstruction *OIList, ModifiedInstruction *MIList, TrashInstruction *TIList, JmpInstruction *JIList,uint32_t numInstructions, uint32_t *sizeOfFixedFunction){
+	
+	*sizeOfFixedFunction = 0;
+	*sizeOfFixedFunction = getNewFunctionSize(insn, OIList, MIList, TIList, JIList, numInstructions);
+	uint8_t *newFunction = NULL;
+	
+	newFunction = malloc(*sizeOfFixedFunction);
+	if(!newFunction){
+		printf("Failed to allocate space for the new function :(");
+		return NULL;
+	}
+	
+	OutsideInstruction *tmpOI = OIList;
+	ModifiedInstruction *tmpMI = MIList;
+	TrashInstruction *tmpTI = TIList;
+	JmpInstruction *tmpJI = JIList;
+	
+	uint32_t counter = 0;
+	uint32_t posInBuffer = 0;
+	while(counter<numInstructions){
+		
+		if(tmpOI){
+			if(tmpOI->id == counter){
+				memcpy(&newFunction[posInBuffer], tmpOI->fixedOI, tmpOI->fixedOISize);
+				posInBuffer += tmpOI->fixedOISize;
+				
+				//free the keystone stuff
+				ks_free(tmpOI->fixedOI);
+				tmpOI->fixedOI = NULL;
+				tmpOI = tmpOI->next;
+				
+				goto trashPart;
+			}
+		}
+		if(tmpMI){
+			if(tmpMI->id == counter){
+				memcpy(&newFunction[posInBuffer], tmpMI->moddedInsn, tmpMI->moddedSize);
+				posInBuffer += tmpMI->moddedSize;
+				
+				ks_free(tmpMI->moddedInsn);
+				tmpMI->moddedInsn = NULL;
+				tmpMI = tmpMI->next;
+				
+				goto trashPart;
+			}
+		}
+		if(tmpJI){
+			if(tmpJI->id == counter){
+				memcpy(&newFunction[posInBuffer], tmpJI->jmpInsn, tmpJI->jmpSize);
+				posInBuffer += tmpJI->jmpSize;
+				
+				ks_free(tmpJI->jmpInsn);
+				tmpJI->jmpInsn = NULL;
+				tmpJI = tmpJI->next;
+				
+				goto trashPart;
+			}
+		}
+		
+		memcpy(&newFunction[posInBuffer], insn[counter].bytes, insn[counter].size);
+		posInBuffer += insn[counter].size;
+		
+		trashPart:
+		if(tmpTI){
+			if(tmpTI->id == counter){
+				memcpy(&newFunction[posInBuffer], tmpTI->trashInsn, tmpTI->trashSize);
+				posInBuffer += tmpTI->trashSize;
+				tmpTI = tmpTI->next;
+			}
+		}
+		
 		counter++;
 	}
 	
-	DWORD *addressBuffer = malloc(counter * sizeof(DWORD));
-	if(!addressBuffer)
-		return FALSE;
-	
-	//Give each abs instruction a unique id
-	DWORD curId = 0;
-	tmp = pAbsInstruction;
-	while(tmp){
-		
-		if(curId > counter)//We fucked
-			return FALSE;
-		
-		if(tmp->type != ABS_CALL){
-			tmp = tmp->next;
-			continue; //Dont increase the id because i'll get us problems
-		}
-		
-		if(tmp->pAbsCall->alreadyStored){
-			tmp = tmp->next;
-			continue; 
-		}
-		
-		//Copy to the address buffer
-		addressBuffer[curId] = tmp->pAbsCall->address;
-		tmp->pAbsCall->idInStorage = curId;
-		tmp->pAbsCall->alreadyStored = TRUE;
-		
-		tmp2 = tmp->next;
-		while(tmp2){
-			
-			if(tmp2->type != ABS_CALL){
-				tmp2 = tmp2->next;
-				continue;
-			}
-			if(tmp2->pAbsCall->alreadyStored){
-				tmp2 = tmp2->next;
-				continue;
-			}
-			
-			if(tmp2->pAbsCall->address == addressBuffer[curId]){
-				tmp2->pAbsCall->idInStorage = curId;
-				tmp2->pAbsCall->alreadyStored = TRUE;
-			}
-			tmp2 = tmp2->next;
-		}
-		
-		tmp = tmp->next;
-		curId++;
-	}
-	
-	HANDLE addressBufferStorage = VirtualAllocEx(hProcess, NULL, (curId+1)*sizeof(DWORD), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-	
-	if(!addressBufferStorage)
-		return FALSE;
-	
-	//Now that everything is setup we'll change the id to the correct memory address
-	tmp = pAbsInstruction;
-	while(tmp){
-		
-		if(tmp->type != ABS_CALL){
-			tmp = tmp->next;
-			continue;
-		}
-		
-		if(!tmp->pAbsCall->alreadyStored)//??
-			return FALSE;
-
-		tmp->pAbsCall->address = (DWORD)(addressBufferStorage+tmp->pAbsCall->idInStorage*sizeof(DWORD));
-		tmp = tmp->next;
-	}
-	
-	if(!WriteProcessMemory(hProcess, (void*)addressBufferStorage, addressBuffer, (curId+1)*sizeof(DWORD), NULL))
-		return FALSE;
-	
-	return TRUE;
+	return newFunction;
 }
 
-BYTE* createNewFunction(const BYTE *originalFunction, DWORD newFunctionSize, PABS_INSTRUCTION pAbsInstruction){
+bool generateAsm2(uint8_t **encoding, size_t *encodingSize, const uint8_t *asmString, ...){
 	
-	DWORD curPosOrig = 0, curPosNew = 0;
-	DWORD sizeDifference = 0;
+	uint32_t sizeOfAsmString = strlen(asmString);
+	uint32_t sizeScanned = 0;
+	uint32_t curNumber = 0;
+	uint8_t *curPosString = NULL;
+	uint32_t numReplace = 0;
+	static uint8_t asmBuffer[128];
+	static uint8_t asmBuffer2[128];
+	static uint32_t indexOrder[32];//should be enough
+	uint32_t curIndexOrder = 0;
+	uint32_t asmBufferPos = 0;
 	
-	PABS_INSTRUCTION tmpAbs;
-	tmpAbs = pAbsInstruction;
-	
-	BYTE* newFunction = NULL;
-	newFunction = malloc(newFunctionSize);
-	
-	if(!newFunction)//Failed
-		return newFunction;
+	//gets the max index and creates indexOrderList
+	while(sizeScanned < sizeOfAsmString){
 		
-	memset(newFunction, 0, newFunctionSize);
-	
-	while(curPosNew != newFunctionSize){
+		curPosString = strstr((&asmString[sizeScanned]), "$");
+		if(!curPosString)
+			break;
 		
-		sizeDifference = 0;
-		memcpy((void*)newFunction+curPosNew, (void*)originalFunction+curPosOrig, ((tmpAbs == NULL) ? newFunctionSize : tmpAbs->bytePosition) - curPosNew);
-		sizeDifference = (((tmpAbs == NULL) ? newFunctionSize : tmpAbs->bytePosition) - curPosNew);
-		curPosNew += sizeDifference;
-		curPosOrig += sizeDifference;
+		numReplace++;
 		
-		if(tmpAbs){
-			memcpy((void*)newFunction+curPosNew, ((tmpAbs->type == ABS_CALL) ? (void*)tmpAbs->pAbsCall : (void*)tmpAbs->pPushRetn), tmpAbs->newSize);//Copy the fixed
-			curPosNew += tmpAbs->newSize;
-			curPosOrig += tmpAbs->originalSize;
-			tmpAbs = tmpAbs->next;
-		}
+		sizeScanned = (uint32_t)curPosString - (uint32_t)asmString + 1;
+		curNumber = atoi(&asmString[sizeScanned]);
+		indexOrder[curIndexOrder++] = curNumber;
+		
 	}
 	
-	return newFunction;
+	//creates a tmp string with the correct formatings
+	sizeScanned = 0;
+	while(sizeScanned <= sizeOfAsmString){
+		if(!numReplace)//only create a tmp string if needed
+			break;
+		
+		curPosString = strstr((&asmString[sizeScanned]), "$");
+		if(!curPosString){
+			while((asmBuffer2[asmBufferPos++] = asmString[sizeScanned++]));//copy the rest of the string must be NULL terminated
+			break;
+		}
+		
+		memcpy(&asmBuffer2[asmBufferPos], &asmString[sizeScanned], (uint32_t)curPosString - (uint32_t)asmString - sizeScanned);
+		asmBufferPos += (uint32_t)curPosString - (uint32_t)asmString - sizeScanned;
+		sizeScanned = (uint32_t)curPosString - (uint32_t)asmString;
+		
+		while(isdigit(asmString[++sizeScanned]));//ignore the index
+		
+		if(asmString[sizeScanned] == 's'){
+			strcpy((char*)&asmBuffer2[asmBufferPos], "%s");
+			asmBufferPos += 2;
+		}
+		else if(asmString[sizeScanned] == 'x'){
+			strcpy((char*)&asmBuffer2[asmBufferPos], "0x%08X");
+			asmBufferPos += 6;
+		}
+		else{
+			printf("Unknown character type\n");
+			return false;
+		}
+		
+		sizeScanned++;
+	}
+	
+	if(numReplace){
+		va_list valist;
+		va_start(valist, asmString);
+		newFormatAsmString(valist, asmBuffer, asmBuffer2, &indexOrder[numReplace-1], numReplace);
+	}
+	else
+		strcpy(asmBuffer, asmString);
+
+	//numReplace=numInstructions
+	sizeScanned = 0;
+	numReplace = 1;//start at 1
+	while(sizeScanned < sizeOfAsmString){
+		
+		curPosString = strstr(&asmString[sizeScanned], ";");
+		if(!curPosString)
+			break;
+		
+		sizeScanned = (uint32_t)curPosString - (uint32_t)asmString + 1;
+		numReplace++;
+	}
+	
+	uint32_t processedInsn = 0;
+	if(ks_asm(ksHandle, asmBuffer, 0, encoding, encodingSize, &processedInsn)){
+		printf("Error %s\n", ks_strerror(ks_errno(ksHandle)));
+	}
+	if(processedInsn != numReplace){
+		printf("Error couldn't process all instructions :(\n");
+		return false;
+	}
+	
+	return true;
 }
